@@ -32,11 +32,14 @@
   var = stmt; \
   ASSERT_ERRNO(error)
 
+#define INFO_LEVEL 1
+#define VERBOSE_LEVEL 2
+
 int verbosity = 0;
 
 typedef struct {
+  double fragmentation;
   blkcnt_t nblocks;
-  blkcnt_t nseq;
 } file_info_t;
 
 file_info_t process_file(const char* pathname) {
@@ -47,56 +50,72 @@ file_info_t process_file(const char* pathname) {
   struct stat file_stat;
   CALL_WITH_ERRNO(fstat(fd, &file_stat), "fstat()");
 
-  INFO(1, "  Block size: %ld\n", file_stat.st_blksize);
+  int block_size;
+  CALL_WITH_ERRNO(ioctl(fd, FIGETBSZ, &block_size), "ioctl(FIGETBSZ)");
+  INFO(INFO_LEVEL, "  Block size: %d\n", block_size);
 
-  blkcnt_t total_blocks = (file_stat.st_size + file_stat.st_blksize - 1) / file_stat.st_blksize;
-  INFO(1, "  Logical blocks: %ld\n", total_blocks);
+  blkcnt_t logical_blocks = (file_stat.st_size + block_size - 1) / block_size;
+  INFO(INFO_LEVEL, "  Logical blocks: %ld\n", logical_blocks);
 
-  file_info_t file_info;
-  file_info.nblocks = file_stat.st_blocks * 512ULL / file_stat.st_blksize;
-  INFO(1, "  Physical blocks: %ld\n", file_info.nblocks);
+  blkcnt_t physical_blocks = file_stat.st_blocks * 512ULL / block_size;
+  INFO(INFO_LEVEL, "  Physical blocks: %ld\n", physical_blocks);
 
-  INFO(2, "  Logical-to-physical block mapping:\n");
-  file_info.nseq = 0;
+  INFO(VERBOSE_LEVEL, "  Logical-to-physical block mapping:\n");
+  blkcnt_t nseq = 0;
   int last_block = 0;
-  for (blkcnt_t i = 0; i < total_blocks; ++i) {
+  for (blkcnt_t i = 0; i < logical_blocks; ++i) {
     int n = i;
     CALL_WITH_ERRNO(ioctl(fd, FIBMAP, &n), "ioctl(FIBMAP)");
-    INFO(2, "    %5ld -> %10d\n", i, n);
-    if ((!last_block && n) || (last_block && n && n != last_block + 1)) {
-      ++file_info.nseq;
+    INFO(VERBOSE_LEVEL, "    %5ld -> %10d\n", i, n);
+    if (n && (!last_block || n != last_block + 1)) {
+      ++nseq;
     }
     last_block = n;
   }
-  INFO(1, "  Extents: %ld\n", file_info.nseq);
+  INFO(INFO_LEVEL, "  Extents: %ld\n", nseq);
+
+  file_info_t file_info = {
+    .fragmentation = (nseq ? (double)physical_blocks / logical_blocks / nseq : 0),
+    .nblocks = logical_blocks
+  };
+  INFO(INFO_LEVEL, "  File fragmentation: %f\n", file_info.fragmentation);
 
   close(fd);
   return file_info;
 }
 
+void opt_verbose() {
+  ++verbosity;
+}
+
+void parse_short_opts(const char* opts) {
+  for (const char* c = opts; *c; ++c) {
+    switch (*c) {
+      case 'v':
+        opt_verbose();
+        break;
+      default:
+        fprintf(stderr, "Option -%c is not recognised\n", *c);
+        exit(EXIT_FAILURE);
+    }
+  }
+}
+
 int main(int argc, const char* argv[]) {
   int first_file = 1;
-  /* int stat_flags = AT_NO_AUTOMOUNT; */
 
-  while (first_file < argc) {
-    if (strcmp(argv[first_file], "-P") == 0 || 
-        strcmp(argv[first_file], "--no-dereference") == 0) {
-      /* stat_flags |= AT_SYMLINK_NOFOLLOW; */
-      fprintf(stderr, "--no-dereference is not yet supported\n");
-      exit(EXIT_FAILURE);
-      /* ++first_file; */
-      /* continue; */
+  for (; first_file < argc; ++first_file) {
+    if (argv[first_file][0] == '-') {
+      parse_short_opts(argv[first_file] + 1);
+    } else if (strcmp(argv[first_file], "--verbose") == 0) {
+      opt_verbose();
+    } else {
+      if (strcmp(argv[first_file], "--") == 0) ++first_file;
+      break;
     }
-    if (strcmp(argv[first_file], "-v") == 0 ||
-        strcmp(argv[first_file], "--verbose") == 0) {
-      ++verbosity;
-      ++first_file;
-      continue;
-    }
-   break;
   }
   if (first_file == argc) {
-    fprintf(stderr, "Usage: %s [-P | --no-dereference] [-v | --verbose] <file1> [file2 ...]", argv[0]);
+    fprintf(stderr, "Usage: %s [-v | --verbose] [--] <file1> [file2 ...]", argv[0]);
     exit(EXIT_FAILURE);
   }
 
@@ -104,7 +123,7 @@ int main(int argc, const char* argv[]) {
   blkcnt_t total_blocks = 0;
   for (int i = first_file; i < argc; ++i) {
     file_info_t info = process_file(argv[i]);
-    weighted_sum += (double)info.nblocks / info.nseq;
+    weighted_sum += info.fragmentation * info.nblocks;
     total_blocks += info.nblocks;
   }
 
